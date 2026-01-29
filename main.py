@@ -41,7 +41,7 @@ MIC_CHUNK_FRAMES = SILERO_WINDOW_SAMPLES
 
 SYSTEM_PROMPT = (
     "Eres un asistente de voz breve, claro y conversacional. "
-    "Responde en español, frases cortas, sin emojis."
+    "Responde en español, frases cortas, no mas de 15 palabras"
 )
 
 # =========================================================
@@ -268,19 +268,54 @@ def create_input_stream(state, mic_queue, device):
         device=device,
     )
 
-async def mic_sender(state, mic_queue, dg_conn):
-    print("[STT] Sender iniciado")
+def _run_silero_vad_chunk(vad_iterator, chunk: bytes):
+    """Ejecuta Silero VAD sobre un chunk de 512 muestras (sync, para executor)."""
+    arr = np.frombuffer(chunk, dtype=np.int16)
+    if len(arr) != SILERO_WINDOW_SAMPLES:
+        return None
+    audio_float = int2float(arr)
+    tensor = torch.from_numpy(audio_float).unsqueeze(0)
+    with torch.no_grad():
+        return vad_iterator(tensor, return_seconds=False)
+
+async def vad_and_send(state, mic_queue, utterance_queue, dg_conn, vad_iterator):
+    """
+    Pipeline: mic → Silero VAD → Deepgram.
+    - Silero start → barge-in si TTS está sonando.
+    - Silero end → enviar state.last_final_transcript a utterance_queue.
+    - Siempre reenvía el chunk a Deepgram.
+    """
+    print("[VAD] Silero + STT sender iniciado")
     while state.running:
         chunk = await mic_queue.get()
         if chunk is None:
             break
+        try:
+            vad_result = await state.loop.run_in_executor(
+                None, _run_silero_vad_chunk, vad_iterator, chunk
+            )
+        except Exception as e:
+            print(f"[VAD] Error Silero: {e}")
+            vad_result = None
+        if vad_result is not None:
+            if "start" in vad_result:
+                print("[VAD][Silero] Speech started")
+                if state.tts_playing:
+                    print("[VAD][VAD-Barge-in] Usuario habló (Silero) → pedir corte TTS")
+                    state.barge_in_event.set()
+            if "end" in vad_result:
+                print("[VAD][Silero] Speech ended (fin de enunciado)")
+                text = (state.last_final_transcript or "").strip()
+                if text:
+                    utterance_queue.put_nowait(text)
+                state.last_final_transcript = ""
         dg_conn.send(chunk)
 
 # =========================================================
-# 🧠 DEEPGRAM STT + VAD
+# 🧠 DEEPGRAM STT (solo transcripción; VAD = Silero)
 # =========================================================
 
-def setup_deepgram(state, utterance_queue):
+def setup_deepgram(state):
     dg = DeepgramClient()
     conn = dg.listen.websocket.v("1")
 
@@ -306,13 +341,13 @@ def setup_deepgram(state, utterance_queue):
         else:
             print(f"\t[STT][STT-Final] {text}")
 
-        # 🔥 Barge-in por texto interim
+        # 🔥 Barge-in por texto interim (Deepgram)
         if state.tts_playing and not result.is_final and len(text.split()) >= 2:
             print("[VAD][VAD-Barge-in] Usuario habló (texto interim) → pedir corte TTS")
             state.barge_in_event.set()
 
         if result.is_final:
-            utterance_queue.put_nowait(text)
+            state.last_final_transcript = text
 
     def transcript_handler(*args, **kwargs):
         result = kwargs.get("result")
@@ -328,47 +363,6 @@ def setup_deepgram(state, utterance_queue):
     conn.on(
         LiveTranscriptionEvents.Transcript,
         transcript_handler,
-    )
-
-    # ---------- VAD: SpeechStarted ----------
-    def on_speech_started(event):
-        print("[VAD][VAD-SpeechStarted] Evento inicio: empezó a hablar")
-
-        if state.tts_playing:
-            print("[VAD][VAD-Barge-in] Usuario habló (VAD SpeechStarted) → pedir corte TTS")
-            state.barge_in_event.set()
-
-    def speech_started_handler(*args, **kwargs):
-        ev = kwargs.get("speech_started")
-        if ev is None:
-            if len(args) >= 2:
-                ev = args[1]
-            elif len(args) == 1:
-                ev = args[0]
-        state.loop.call_soon_threadsafe(on_speech_started, ev)
-
-    conn.on(
-        LiveTranscriptionEvents.SpeechStarted,
-        speech_started_handler,
-    )
-
-    # ---------- VAD: UtteranceEnd ----------
-    def on_utterance_end(event):
-        print("[VAD][VAD-TALKING/STOP] Detenido por silencio (>=1000 ms)")
-        print("[VAD][VAD-UtteranceEnd] Fin de enunciado (evento VAD)")
-
-    def utterance_end_handler(*args, **kwargs):
-        ev = kwargs.get("utterance_end")
-        if ev is None:
-            if len(args) >= 2:
-                ev = args[1]
-            elif len(args) == 1:
-                ev = args[0]
-        state.loop.call_soon_threadsafe(on_utterance_end, ev)
-
-    conn.on(
-        LiveTranscriptionEvents.UtteranceEnd,
-        utterance_end_handler,
     )
 
     # ---------- ERRORES / CIERRE ----------
@@ -394,7 +388,7 @@ def setup_deepgram(state, utterance_queue):
 
     conn.on(LiveTranscriptionEvents.Close, close_handler)
 
-    # ---------- INICIO DEL STREAM ----------
+    # ---------- INICIO DEL STREAM (sin VAD de Deepgram; usamos Silero) ----------
     conn.start(
         LiveOptions(
             model="nova-3",
@@ -403,8 +397,7 @@ def setup_deepgram(state, utterance_queue):
             sample_rate=MIC_SAMPLE_RATE,
             channels=1,
             interim_results=True,
-            vad_events=True,
-            utterance_end_ms=1000,
+            vad_events=False,
         )
     )
 
@@ -436,7 +429,7 @@ async def main():
         print("ERROR: OPENAI_API_KEY no definido")
         return
 
-    print(f"[AUDIO] Mic: {MIC_SAMPLE_RATE} Hz")
+    print(f"[AUDIO] Mic: {MIC_SAMPLE_RATE} Hz (chunks {SILERO_WINDOW_SAMPLES} muestras para Silero VAD)")
 
     state = State()
     openai_client = OpenAI()
@@ -445,11 +438,15 @@ async def main():
     utterance_queue = asyncio.Queue()
     tts_queue = asyncio.Queue()
 
-    dg_conn = setup_deepgram(state, utterance_queue)
+    print("[VAD] Cargando Silero VAD…")
+    vad_iterator = load_silero_vad()
+    print("[VAD] Silero VAD listo")
+
+    dg_conn = setup_deepgram(state)
     mic_stream = create_input_stream(state, mic_queue, args.input_device)
 
     tasks = [
-        asyncio.create_task(mic_sender(state, mic_queue, dg_conn)),
+        asyncio.create_task(vad_and_send(state, mic_queue, utterance_queue, dg_conn, vad_iterator)),
         asyncio.create_task(llm_worker(state, openai_client, utterance_queue, tts_queue)),
         asyncio.create_task(tts_worker(state, tts_queue)),
     ]
