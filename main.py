@@ -39,7 +39,7 @@ class State:
         self.utterance_buffer: List[str] = []
         self.running: bool = True
 
-
+# Esta funcion junta todo streamming y completo lo reproduce en el dispositivo de salida. Genera latencia.
 async def synth_tts_deepgram(text: str) -> bytes:
     """
     Llama al TTS REST de Deepgram y devuelve audio PCM16 mono 16k.
@@ -71,6 +71,43 @@ async def synth_tts_deepgram(text: str) -> bytes:
             resp.raise_for_status()
             chunks = [chunk async for chunk in resp.aiter_bytes()]
     return b"".join(chunks)
+
+
+async def stream_tts_deepgram(text: str):
+    """
+    Versión streaming: produce chunks de audio PCM16 a medida que Deepgram los envía.
+    Yields: trozos de bytes (múltiplos de 2 bytes).
+    """
+    api_key = os.environ.get("DEEPGRAM_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPGRAM_API_KEY no está definido.")
+
+    params = {
+        "model": "aura-2-thalia-en",  # ajustable
+        "encoding": "linear16",
+        "sample_rate": str(SAMPLE_RATE),
+    }
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {"text": text}
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST",
+            "https://api.deepgram.com/v1/speak",
+            params=params,
+            headers=headers,
+            json=payload,
+        ) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
+                yield chunk
+
+
 
 
 async def llm_worker(
@@ -126,56 +163,87 @@ async def tts_worker(
     tts_text_queue: asyncio.Queue,
 ) -> None:
     """
-    Consume textos para TTS, sintetiza con Deepgram y reproduce con sounddevice.
-    Soporta barge-in usando state.barge_in_event + sounddevice.stop().
+    Consume textos para TTS, sintetiza con Deepgram y reproduce en streaming.
+    Escribe en el RawOutputStream desde un thread (run_in_executor) para no
+    bloquear el event loop y permitir un barge-in sensible.
     """
     print("[TTS] Worker iniciado.")
-    while state.running:
-        try:
+
+    # Un solo stream de salida que reusamos
+    out_stream = sd.RawOutputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=CHUNK_FRAMES,
+        dtype="int16",
+        channels=CHANNELS,
+        device=sd.default.device[1] if sd.default.device is not None else None,
+    )
+
+    out_stream.start()
+
+    # Tamaño de frame en bytes para ~CHUNK_MS ms de audio
+    FRAME_BYTES = CHUNK_FRAMES * CHANNELS * 2  # int16 -> 2 bytes
+
+    try:
+        while state.running:
             text = await tts_text_queue.get()
             if text is None:
                 break
 
-            print("[TTS] Sintetizando con Deepgram...")
-            audio_bytes = await synth_tts_deepgram(text)
+            print("[TTS] Sintetizando con Deepgram (streaming)...")
 
-            # PCM16 mono 16k
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-
-            duration = len(audio_np) / float(SAMPLE_RATE)
-            if duration <= 0:
-                print("[TTS] Audio vacío, saltando.")
-                continue
-
-            # Resetear evento de barge-in para esta locución
+            # Resetear evento de barge-in
             state.barge_in_event.clear()
             state.tts_playing = True
 
-            print(f"[AUDIO] Reproduciendo TTS (duración ~{duration:.2f}s)...")
-            sd.play(audio_np, samplerate=SAMPLE_RATE, blocking=False)
+            # Buffer local para reconstruir frames completos
+            pending = b""
 
             try:
-                # Espera hasta que:
-                #   - termine el audio (timeout)
-                #   - o llegue un barge-in (evento)
-                await asyncio.wait_for(
-                    state.barge_in_event.wait(), timeout=duration + 0.5
-                )
-                # Si entra aquí por barge-in:
-                if state.barge_in_event.is_set():
-                    print("[CTRL] Barge-in: stopping TTS (evento detectado).")
-            except asyncio.TimeoutError:
-                # No hubo barge-in; playback terminó (o casi)
-                pass
+                async for chunk in stream_tts_deepgram(text):
+                    # Comprobamos barge-in en cada iteración del streaming HTTP
+                    if state.barge_in_event.is_set():
+                        print("[CTRL] Barge-in: stopping TTS (evento detectado, streaming).")
+                        # Dejamos de consumir más audio del TTS
+                        break
+
+                    if not chunk:
+                        continue
+
+                    pending += chunk
+
+                    # Mientras tengamos al menos un frame completo, lo mandamos a salida
+                    while len(pending) >= FRAME_BYTES:
+                        audio_bytes = pending[:FRAME_BYTES]
+                        pending = pending[FRAME_BYTES:]
+
+                        audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+                        if audio_np.size == 0:
+                            continue
+
+                        # IMPORTANTE: escribir en un thread para no bloquear el loop
+                        await state.loop.run_in_executor(
+                            None, out_stream.write, audio_np.tobytes()
+                        )
+
+                    # Ceder el control al loop para que procese eventos STT/VAD
+                    await asyncio.sleep(0)
+
+                # Si terminamos el streaming sin barge-in, lo que ya está en el
+                # buffer interno del stream se reproducirá solo.
+                # No hace falta hacer nada especial aquí.
+
+            except Exception as e:
+                print(f"[TTS] Error durante streaming TTS: {e}")
             finally:
-                sd.stop()
                 state.tts_playing = False
                 state.barge_in_event.clear()
 
-        except Exception as e:
-            print(f"[TTS] Error: {e}")
-            state.tts_playing = False
-            state.barge_in_event.clear()
+    finally:
+        try:
+            out_stream.stop()
+            out_stream.close()
+        except Exception:
+            pass
 
 
 def create_input_stream(
