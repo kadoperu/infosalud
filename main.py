@@ -50,7 +50,7 @@ async def synth_tts_deepgram(text: str) -> bytes:
         raise RuntimeError("DEEPGRAM_API_KEY no está definido.")
 
     params = {
-        "model": "aura-2-thalia-en",  # puedes cambiar de voz/modelo
+        "model": "aura-2-asteria-es",  # puedes cambiar de voz/modelo aura-2-thalia-en
         "encoding": "linear16",
         "sample_rate": str(SAMPLE_RATE),
     }
