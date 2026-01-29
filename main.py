@@ -5,11 +5,10 @@ Asistente de voz en consola con:
 - OpenAI LLM
 - ElevenLabs TTS (streaming real vía ffplay)
 - Barge-in robusto (VAD + texto intermedio)
-
-Notas importantes:
-- El micrófono se captura con sounddevice a 16 kHz (Deepgram).
-- El TTS se reproduce con ffplay, que decodifica el mp3 de ElevenLabs.
-- Necesitas tener ffmpeg/ffplay instalado en el sistema.
+- Etiquetas de diagnóstico:
+  [VAD-TAKLING], [VAD-TALKING/STOP], [STT-Interim], [STT-Final],
+  [LLM][HUMAN], [LLM][AI], [TTS-Start], [TTS-Chunk], [TTS-End],
+  [VAD][VAD-Barge-in], [CTRL-Barge-in], [VAD-SpeechStarted], [VAD-UtteranceEnd]
 """
 
 # python main.py --list-devices
@@ -20,10 +19,9 @@ import asyncio
 import os
 import signal
 import subprocess
-from typing import List, Optional
+from typing import List
 
 import httpx
-import numpy as np
 import sounddevice as sd
 from openai import OpenAI
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
@@ -35,10 +33,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 🔊 SAMPLE RATES
-MIC_SAMPLE_RATE = 16000     # Deepgram STT requiere 16 kHz
+MIC_SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_MS = 40               # Tamaño de bloque (~latencia)
+CHUNK_MS = 40
 MIC_CHUNK_FRAMES = int(MIC_SAMPLE_RATE * CHUNK_MS / 1000)
 
 SYSTEM_PROMPT = (
@@ -55,13 +52,11 @@ ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID")
 
 if not ELEVEN_API_KEY:
     raise RuntimeError("ELEVEN_API_KEY no definido")
-
 if not ELEVEN_VOICE_ID:
     raise RuntimeError("ELEVEN_VOICE_ID no definido")
 
-
 # =========================================================
-# 🧠 ESTADO GLOBAL COMPARTIDO
+# 🧠 ESTADO GLOBAL
 # =========================================================
 
 class State:
@@ -72,32 +67,37 @@ class State:
         self.history: List[dict] = []
         self.running = True
 
+# =========================================================
+# 🔊 UTILIDAD: LISTAR DISPOSITIVOS
+# =========================================================
+
+def list_audio_devices():
+    print("=== Dispositivos de audio disponibles ===")
+    print(sd.query_devices())
 
 # =========================================================
-# 🔊 ELEVENLABS — STREAM TTS (MP3) → ffplay
+# 🔊 ELEVENLABS TTS
 # =========================================================
+
+# pcm_44100 requiere plan Pro en ElevenLabs (403 sin Pro). Usamos 16 kHz para todos los planes.
+TTS_SAMPLE_RATE = 16000
+TTS_OUTPUT_FORMAT = f"pcm_{TTS_SAMPLE_RATE}"
 
 async def stream_tts_elevenlabs(text: str):
     """
-    Genera audio en streaming desde ElevenLabs (mp3).
-    No lo decodificamos aquí: se lo pasamos tal cual a ffplay.
+    Streaming PCM 16-bit desde ElevenLabs (crudo, sin archivos).
+    output_format va como query parameter (la API lo ignora si está en el body).
     """
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}/stream"
-
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}/stream?output_format={TTS_OUTPUT_FORMAT}"
     headers = {
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json",
-        "Accept": "audio/mpeg",  # dejamos claro que queremos mp3
+        "Accept": "audio/pcm",
     }
-
     payload = {
         "text": text,
         "model_id": "eleven_multilingual_v2",
-        "output_format": "mp3_44100_128",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-        },
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }
 
     async with httpx.AsyncClient(timeout=None) as client:
@@ -108,55 +108,45 @@ async def stream_tts_elevenlabs(text: str):
                     yield chunk
 
 
+
+
 # =========================================================
-# 🧠 LLM WORKER (OpenAI)
+# 🧠 LLM WORKER
 # =========================================================
 
-async def llm_worker(
-    state: State,
-    openai_client: OpenAI,
-    utterance_queue: asyncio.Queue,
-    tts_text_queue: asyncio.Queue,
-):
+async def llm_worker(state, openai_client, utterance_queue, tts_text_queue):
     print("[LLM] Worker iniciado")
-
     while state.running:
         text = await utterance_queue.get()
         if text is None:
             break
 
-        print(f"[LLM] Usuario: {text}")
+        print(f"[LLM][HUMAN] {text}")
 
         def call_llm():
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(state.history[-6:])
             messages.append({"role": "user", "content": text})
-
-            response = openai_client.chat.completions.create(
+            r = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
             )
-            return response.choices[0].message.content.strip()
+            return r.choices[0].message.content.strip()
 
-        response_text = await state.loop.run_in_executor(None, call_llm)
-        print(f"[LLM] Respuesta: {response_text}")
+        response = await state.loop.run_in_executor(None, call_llm)
+        print(f"[LLM][AI] {response}")
 
-        state.history.append({"role": "user", "content": text})
-        state.history.append({"role": "assistant", "content": response_text})
-
-        await tts_text_queue.put(response_text)
-
+        state.history += [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": response},
+        ]
+        await tts_text_queue.put(response)
 
 # =========================================================
-# 🔊 TTS WORKER (ffplay, sin chisquidos)
+# 🔊 TTS WORKER (stream crudo a ffplay, sin archivos)
 # =========================================================
 
-async def tts_worker(state: State, tts_text_queue: asyncio.Queue):
-    """
-    Toma texto, lo manda a ElevenLabs en streaming, y los bytes
-    los envía a ffplay, que se encarga de decodificar y reproducir.
-    Con barge-in: si VAD detecta voz o STT capta texto, se corta ffplay.
-    """
+async def tts_worker(state, tts_text_queue):
     print("[TTS] Worker iniciado")
 
     while state.running:
@@ -164,190 +154,230 @@ async def tts_worker(state: State, tts_text_queue: asyncio.Queue):
         if text is None:
             break
 
-        print("[TTS] Sintetizando con ElevenLabs…")
-
-        # Marcamos que TTS está sonando
         state.barge_in_event.clear()
         state.tts_playing = True
 
-        # Lanzamos ffplay para reproducir desde stdin
-        proc = subprocess.Popen(
-            [
-                "ffplay",
-                "-autoexit",
-                "-nodisp",
-                "-loglevel",
-                "quiet",
-                "-",  # stdin
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        print("[TTS][TTS-Start] Enviando texto a ElevenLabs…")
+        print(f"[TTS] Texto: {text}")
+
+        # ffplay: PCM crudo s16le mono desde stdin (-ac no está disponible en este contexto en ffplay)
+        try:
+            proc = subprocess.Popen(
+                [
+                    "ffplay",
+                    "-f", "s16le",
+                    "-ar", str(TTS_SAMPLE_RATE),
+                    "-autoexit",
+                    "-nodisp",
+                    "-",
+                ],
+                stdin=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            print("[TTS] ERROR: ffplay no encontrado en PATH. Instala ffmpeg.")
+            state.tts_playing = False
+            state.barge_in_event.clear()
+            continue
 
         try:
             async for chunk in stream_tts_elevenlabs(text):
-                # Si el usuario habla → barge-in
                 if state.barge_in_event.is_set():
-                    print("[CTRL] Barge-in: deteniendo TTS (ffplay)")
+                    print("[CTRL-Barge-in] Deteniendo TTS por barge-in")
                     break
 
                 if proc.stdin:
-                    proc.stdin.write(chunk)
-                    proc.stdin.flush()
+                    try:
+                        proc.stdin.write(chunk)
+                        proc.stdin.flush()
+                    except BrokenPipeError:
+                        print("[TTS] ffplay cerró stdin (Broken pipe)")
+                        break
 
-                await asyncio.sleep(0)  # ceder al loop
-
-            # Cerramos stdin para que ffplay termine (si no hubo barge-in)
-            if proc.stdin and not state.barge_in_event.is_set():
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-
-            # Si hubo barge-in y el proceso sigue vivo → lo matamos
-            if state.barge_in_event.is_set() and proc.poll() is None:
-                proc.terminate()
-
+                print(f"[TTS][TTS-Chunk] {len(chunk)} bytes")
+                await asyncio.sleep(0)
+        except Exception as e:
+            print(f"[TTS] Error durante streaming TTS: {e}")
         finally:
             state.tts_playing = False
             state.barge_in_event.clear()
+            print("[TTS][TTS-End] Fin de reproducción")
+
+            # Cerramos stdin y esperamos a que ffplay termine
             try:
-                proc.wait(timeout=1)
+                if proc.stdin:
+                    proc.stdin.close()
             except Exception:
                 pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
 
 
 # =========================================================
-# 🎤 MICRÓFONO → DEEPGRAM
+# 🎤 MICRÓFONO
 # =========================================================
 
-def create_input_stream(state: State, mic_queue: asyncio.Queue, device: Optional[int]):
-
+def create_input_stream(state, mic_queue, device):
     def callback(indata, frames, time, status):
         if status:
             print("[MIC] Status:", status)
-        # Mandamos los bytes crudos al mic_queue
         state.loop.call_soon_threadsafe(mic_queue.put_nowait, bytes(indata))
 
     return sd.RawInputStream(
         samplerate=MIC_SAMPLE_RATE,
         blocksize=MIC_CHUNK_FRAMES,
         dtype="int16",
-        channels=CHANNELS,
+        channels=1,
         callback=callback,
         device=device,
     )
 
-
-async def mic_sender(state: State, mic_queue: asyncio.Queue, dg_conn):
+async def mic_sender(state, mic_queue, dg_conn):
     print("[STT] Sender iniciado")
-
     while state.running:
         chunk = await mic_queue.get()
         if chunk is None:
             break
         dg_conn.send(chunk)
 
-
 # =========================================================
-# 🧠 DEEPGRAM STT + VAD (con logs)
+# 🧠 DEEPGRAM STT + VAD
 # =========================================================
 
-def setup_deepgram(state: State, utterance_queue: asyncio.Queue):
-
+def setup_deepgram(state, utterance_queue):
     dg = DeepgramClient()
     conn = dg.listen.websocket.v("1")
 
-    # ---- Manejo de TRANSCRIPCIONES ----
+    # ---------- TRANSCRIPCIÓN ----------
     def handle_transcript(result):
-        """
-        Maneja eventos de transcripción de Deepgram.
-        """
-        if not hasattr(result, "channel") or not result.channel.alternatives:
+        if not hasattr(result, "channel"):
+            return
+        if not result.channel.alternatives:
             return
 
         alt = result.channel.alternatives[0]
-        transcript = (alt.transcript or "").strip()
-        if not transcript:
+        text = (alt.transcript or "").strip()
+        if not text:
             return
 
-        is_final = getattr(result, "is_final", False)
-
-        if is_final:
-            print(f"[STT] Final: {transcript}")
-            utterance_queue.put_nowait(transcript)
+        level = getattr(alt, "confidence", None)
+        if not result.is_final:
+            if level is not None:
+                print(f"[VAD][VAD-TAKLING] level={level:.2f}")
+            else:
+                print("[VAD][VAD-TAKLING] level=?")
+            print(f"\t[STT][STT-Interim] {text}")
         else:
-            print(f"[STT] Interim: {transcript}")
+            print(f"\t[STT][STT-Final] {text}")
 
-        # Barge-in basado en texto intermedio "suficiente"
-        if state.tts_playing and not is_final:
-            if len(transcript.split()) >= 2:
-                print("[CTRL] Barge-in por STT interim")
-                state.barge_in_event.set()
-
-    def transcript_handler(*args, **kwargs):
-        """
-        Wrapper para adaptarse a las distintas formas en que el SDK
-        pasa el objeto de resultado. Solo pasa 'result' como posicional
-        a handle_transcript (sin kwargs, para no romper asyncio).
-        """
-        result = None
-        if "result" in kwargs:
-            result = kwargs["result"]
-        elif len(args) >= 2:
-            result = args[1]
-        elif len(args) == 1:
-            result = args[0]
-
-        if result is None:
-            return
-
-        state.loop.call_soon_threadsafe(handle_transcript, result)
-
-    # ---- Manejo de VAD ----
-    def handle_speech_started():
-        print("[VAD] SpeechStarted")
-        # Barge-in inmediato si TTS está sonando
-        if state.tts_playing:
-            print("[CTRL] Barge-in por VAD")
+        # 🔥 Barge-in por texto interim
+        if state.tts_playing and not result.is_final and len(text.split()) >= 2:
+            print("[VAD][VAD-Barge-in] Usuario habló (texto interim) → pedir corte TTS")
             state.barge_in_event.set()
 
-    def handle_utterance_end():
-        print("[VAD] UtteranceEnd")
+        if result.is_final:
+            utterance_queue.put_nowait(text)
 
-    # Registro de eventos
+    def transcript_handler(*args, **kwargs):
+        result = kwargs.get("result")
+        if result is None:
+            if len(args) >= 2:
+                result = args[1]
+            elif len(args) == 1:
+                result = args[0]
+        if result is None:
+            return
+        state.loop.call_soon_threadsafe(handle_transcript, result)
+
     conn.on(
         LiveTranscriptionEvents.Transcript,
         transcript_handler,
     )
 
+    # ---------- VAD: SpeechStarted ----------
+    def on_speech_started(event):
+        print("[VAD][VAD-SpeechStarted] Evento inicio: empezó a hablar")
+
+        if state.tts_playing:
+            print("[VAD][VAD-Barge-in] Usuario habló (VAD SpeechStarted) → pedir corte TTS")
+            state.barge_in_event.set()
+
+    def speech_started_handler(*args, **kwargs):
+        ev = kwargs.get("speech_started")
+        if ev is None:
+            if len(args) >= 2:
+                ev = args[1]
+            elif len(args) == 1:
+                ev = args[0]
+        state.loop.call_soon_threadsafe(on_speech_started, ev)
+
     conn.on(
         LiveTranscriptionEvents.SpeechStarted,
-        lambda *a, **k: state.loop.call_soon_threadsafe(handle_speech_started),
+        speech_started_handler,
     )
+
+    # ---------- VAD: UtteranceEnd ----------
+    def on_utterance_end(event):
+        print("[VAD][VAD-TALKING/STOP] Detenido por silencio (>=1000 ms)")
+        print("[VAD][VAD-UtteranceEnd] Fin de enunciado (evento VAD)")
+
+    def utterance_end_handler(*args, **kwargs):
+        ev = kwargs.get("utterance_end")
+        if ev is None:
+            if len(args) >= 2:
+                ev = args[1]
+            elif len(args) == 1:
+                ev = args[0]
+        state.loop.call_soon_threadsafe(on_utterance_end, ev)
 
     conn.on(
         LiveTranscriptionEvents.UtteranceEnd,
-        lambda *a, **k: state.loop.call_soon_threadsafe(handle_utterance_end),
+        utterance_end_handler,
     )
 
-    # Configuración del streaming con VAD
-    options = LiveOptions(
-        model="nova-3",
-        language="es",
-        encoding="linear16",
-        sample_rate=MIC_SAMPLE_RATE,
-        channels=1,
-        interim_results=True,
-        vad_events=True,
-        utterance_end_ms=1000,
+    # ---------- ERRORES / CIERRE ----------
+    def on_error(error, **kwargs):
+        print(f"[STT] Error en WebSocket de Deepgram: {error}")
+
+    def error_handler(*args, **kwargs):
+        err = kwargs.get("error")
+        if err is None and args:
+            err = args[-1]
+        state.loop.call_soon_threadsafe(on_error, err)
+
+    conn.on(LiveTranscriptionEvents.Error, error_handler)
+
+    def on_close(close, **kwargs):
+        print(f"[STT] WebSocket cerrado: {close}")
+
+    def close_handler(*args, **kwargs):
+        cl = kwargs.get("close")
+        if cl is None and args:
+            cl = args[-1]
+        state.loop.call_soon_threadsafe(on_close, cl)
+
+    conn.on(LiveTranscriptionEvents.Close, close_handler)
+
+    # ---------- INICIO DEL STREAM ----------
+    conn.start(
+        LiveOptions(
+            model="nova-3",
+            language="es",
+            encoding="linear16",
+            sample_rate=MIC_SAMPLE_RATE,
+            channels=1,
+            interim_results=True,
+            vad_events=True,
+            utterance_end_ms=1000,
+        )
     )
 
-    conn.start(options)
     print("[STT] Conectado a Deepgram")
     return conn
-
 
 # =========================================================
 # 🚀 MAIN
@@ -355,39 +385,37 @@ def setup_deepgram(state: State, utterance_queue: asyncio.Queue):
 
 async def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--input-device", type=int)
     parser.add_argument("--output-device", type=int)
     args = parser.parse_args()
 
-    # Configurar dispositivos de audio por defecto si se pasan índices
+    if args.list_devices:
+        list_audio_devices()
+        return
+
     if args.input_device is not None or args.output_device is not None:
         sd.default.device = (args.input_device, args.output_device)
 
-    print(f"[AUDIO] Mic: {MIC_SAMPLE_RATE} Hz")
-
-    # Validar API keys de Deepgram y OpenAI
     if not os.environ.get("DEEPGRAM_API_KEY"):
-        print("ERROR: DEEPGRAM_API_KEY no está definido.")
+        print("ERROR: DEEPGRAM_API_KEY no definido")
+        return
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("ERROR: OPENAI_API_KEY no definido")
         return
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY no está definido.")
-        return
+    print(f"[AUDIO] Mic: {MIC_SAMPLE_RATE} Hz")
 
     state = State()
     openai_client = OpenAI()
 
-    mic_queue: asyncio.Queue = asyncio.Queue()
-    utterance_queue: asyncio.Queue = asyncio.Queue()
-    tts_queue: asyncio.Queue = asyncio.Queue()
+    mic_queue = asyncio.Queue()
+    utterance_queue = asyncio.Queue()
+    tts_queue = asyncio.Queue()
 
-    # STT Deepgram
     dg_conn = setup_deepgram(state, utterance_queue)
-
-    # Mic
     mic_stream = create_input_stream(state, mic_queue, args.input_device)
 
-    # Tareas
     tasks = [
         asyncio.create_task(mic_sender(state, mic_queue, dg_conn)),
         asyncio.create_task(llm_worker(state, openai_client, utterance_queue, tts_queue)),
@@ -400,43 +428,27 @@ async def main():
     stop_event = asyncio.Event()
 
     def stop():
-        print("\n[CTRL] Señal de parada recibida. Cerrando…")
         stop_event.set()
 
     try:
         asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop)
     except NotImplementedError:
-        # En Windows puede no estar disponible
         pass
 
     await stop_event.wait()
 
-    # Apagado limpio
     state.running = False
-
-    try:
-        mic_stream.stop()
-        mic_stream.close()
-    except Exception:
-        pass
-
-    try:
-        dg_conn.finish()
-    except Exception:
-        pass
+    mic_stream.stop()
+    dg_conn.finish()
 
     for q in (mic_queue, utterance_queue, tts_queue):
-        try:
-            q.put_nowait(None)
-        except Exception:
-            pass
+        q.put_nowait(None)
 
     for t in tasks:
         t.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
     print("👋 Salida limpia")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
