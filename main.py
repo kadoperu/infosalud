@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Asistente de voz en consola con:
-- Deepgram STT (streaming + VAD)
-- OpenAI LLM
-- ElevenLabs TTS (streaming real vía ffplay)
-- Barge-in robusto (VAD + texto intermedio)
-- Etiquetas de diagnóstico:
-  [VAD-TAKLING], [VAD-TALKING/STOP], [STT-Interim], [STT-Final],
-  [LLM][HUMAN], [LLM][AI], [TTS-Start], [TTS-Chunk], [TTS-End],
-  [VAD][VAD-Barge-in], [CTRL-Barge-in], [VAD-SpeechStarted], [VAD-UtteranceEnd]
+Pipeline conversacional de voz en tiempo real:
+  voz input → VAD Silero → STT Deepgram → LLM OpenAI → TTS ElevenLabs → voz output
+
+- VAD: Silero-VAD (snakers4/silero-vad), no Deepgram VAD
+- STT: Deepgram (solo transcripción, sin vad_events)
+- Barge-in: Silero speech start + texto interim de Deepgram
 """
 
 # python main.py --list-devices
@@ -22,7 +19,9 @@ import subprocess
 from typing import List
 
 import httpx
+import numpy as np
 import sounddevice as sd
+import torch
 from openai import OpenAI
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from dotenv import load_dotenv
@@ -35,8 +34,10 @@ load_dotenv()
 
 MIC_SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_MS = 40
-MIC_CHUNK_FRAMES = int(MIC_SAMPLE_RATE * CHUNK_MS / 1000)
+# Silero VAD espera chunks de 512 muestras a 16 kHz (32 ms)
+SILERO_WINDOW_SAMPLES = 512
+CHUNK_MS = int(1000 * SILERO_WINDOW_SAMPLES / MIC_SAMPLE_RATE)  # 32
+MIC_CHUNK_FRAMES = SILERO_WINDOW_SAMPLES
 
 SYSTEM_PROMPT = (
     "Eres un asistente de voz breve, claro y conversacional. "
@@ -66,6 +67,7 @@ class State:
         self.tts_playing = False
         self.history: List[dict] = []
         self.running = True
+        self.last_final_transcript = ""  # último final de Deepgram (se envía a LLM cuando Silero dice "fin de voz")
 
 # =========================================================
 # 🔊 UTILIDAD: LISTAR DISPOSITIVOS
@@ -74,6 +76,36 @@ class State:
 def list_audio_devices():
     print("=== Dispositivos de audio disponibles ===")
     print(sd.query_devices())
+
+# =========================================================
+# 🎙️ SILERO VAD
+# =========================================================
+
+def load_silero_vad():
+    """Carga el modelo Silero VAD y el VADIterator para streaming (512 muestras @ 16 kHz)."""
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        trust_repo=True,
+    )
+    (_, _, _, VADIterator, _) = utils
+    vad_iterator = VADIterator(
+        model,
+        threshold=0.5,
+        sampling_rate=MIC_SAMPLE_RATE,
+        min_silence_duration_ms=400,
+        speech_pad_ms=30,
+    )
+    return vad_iterator
+
+def int2float(audio_int16: np.ndarray) -> np.ndarray:
+    """Convierte int16 a float32 [-1, 1] para Silero."""
+    audio = audio_int16.astype(np.float32)
+    abs_max = np.abs(audio).max()
+    if abs_max > 0:
+        audio /= 32768.0
+    return audio
 
 # =========================================================
 # 🔊 ELEVENLABS TTS
