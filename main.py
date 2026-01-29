@@ -12,6 +12,9 @@ Notas importantes:
 - Necesitas tener ffmpeg/ffplay instalado en el sistema.
 """
 
+# python main.py --list-devices
+# python main.py --input-device 1 --output-device 2
+
 import argparse
 import asyncio
 import os
