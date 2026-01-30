@@ -23,15 +23,18 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["*"]
 
 [tool.hatch.build.targets.wheel]
-include = [
-  "main.py",
-  "agent",
-  "graph",
-  "tools"
+packages = ["src/voice_pipeline", "src/agents", "src/api"]
+sources = ["src"]
+
+[dependency-groups]
+dev = [
+    "grandalf>=0.8",
+    "ipykernel>=7.1.0",
+    "langgraph-cli[inmem]>=0.4.12",
 ]
 
 
