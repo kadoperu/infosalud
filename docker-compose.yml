@@ -1,0 +1,122 @@
+version: "3.9"
+
+networks:
+  voice_net:
+    driver: bridge
+
+services:
+
+  # --------------------------------------------------
+  # PostgreSQL (persistencia central)
+  # --------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: pg_core
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: coredb
+      POSTGRES_USER: soporte
+      POSTGRES_PASSWORD: conexion
+    ports:
+      - "5432:5432"        # acceso desde host (LangGraph)
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+    networks:
+      - voice_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soporte"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # --------------------------------------------------
+  # Asterisk (SIP + AudioSocket)
+  # --------------------------------------------------
+  asterisk:
+    build: ./asterisk
+    container_name: asterisk
+    restart: unless-stopped
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-20000:10000-20000/udp"
+      - "8088:8088"        # http / audiosocket
+    volumes:
+      - ./asterisk/config:/etc/asterisk
+      - ./asterisk/sounds:/var/lib/asterisk/sounds/custom
+      - ./asterisk/logs:/var/log/asterisk
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - voice_net
+
+
+  # --------------------------------------------------
+  # Whisper STT (faster-whisper LARGE)
+  # --------------------------------------------------
+  whisper:
+    image: dgx-whisper-large
+    container_name: whisper_stt
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      WHISPER_MODEL: large-v3
+      WHISPER_DEVICE: cuda
+    ports:
+      - "8001:8000"        # WS / HTTP STT
+    networks:
+      - voice_net
+
+
+  # --------------------------------------------------
+  # LLM OSS 20B
+  # --------------------------------------------------
+  llm:
+    image: dgx-oss-20b
+    container_name: llm_oss_20b
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      MODEL_NAME: openoss-20b
+      MAX_TOKENS: 512
+    ports:
+      - "8002:8000"        # API LLM
+    networks:
+      - voice_net
+
+
+  # --------------------------------------------------
+  # TTS – Chatterbox Turbo
+  # --------------------------------------------------
+  tts:
+    image: dgx-chatterbox-tts
+    container_name: tts_chatterbox
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      TTS_MODEL: chatterbox-turbo
+      SAMPLE_RATE: 16000
+    ports:
+      - "8003:8000"        # API / WS TTS
+    networks:
+      - voice_net
