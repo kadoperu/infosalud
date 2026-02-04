@@ -70,8 +70,12 @@ def get_openai_api_key() -> str:
 # -----------------------------------------------------------------------------
 # VAD (Silero) - parámetros opcionales
 # -----------------------------------------------------------------------------
+# sensibilidad threshold: 0.5 - 1.0, default 0.5
+# duracion de silencio min_silence_duration_ms: 400 - 1000
+# padding depeech_pad_ms: 30 - 100
+
 @dataclass(frozen=True)
 class SileroVADConfig:
-    threshold: float = 0.5
+    threshold: float = 0.3
     min_silence_duration_ms: int = 400
     speech_pad_ms: int = 30

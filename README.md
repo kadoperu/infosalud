@@ -196,3 +196,92 @@ def get_checkpointer() -> PostgresSaver:
 CheckpointerDep = Annotated[PostgresSaver, Depends(get_checkpointer)]
 ```
 </details>
+
+
+
+
+DGX Spark
+├── docker-compose.yml
+│
+├── postgres/
+│   └── data/                 # volumen persistente
+│
+├── asterisk/
+│   ├── config/
+│   ├── sounds/
+│   └── logs/
+│
+├── whisper (stt) /
+│   └── server_ws.py          # faster-whisper WS
+│
+├── llm/
+│   └── server.py             # OpenOSS 20B
+│
+├── tts (tts) /
+│   └── server.py             # Chatterbox Turbo
+│
+└── venv/                     # aquí corre LangGraph (host)
+
+
+POSTGRES_URL = "postgresql://soporte:conexion@localhost:5432/coredb"
+
+ASTERISK_AUDIO_WS = "ws://localhost:8088/audio"
+WHISPER_WS        = "ws://localhost:8001/stt"
+LLM_API           = "http://localhost:8002/v1/chat"
+TTS_API           = "http://localhost:8003/tts"
+
+
+
+Instalacion docker compose
+
+✅ 1. Ir al directorio donde está el compose
+
+1.- cd ~/Projects
+2.- ls
+    docker-compose.yml
+
+✅ 2. Revisar que Docker Compose esté instalado
+
+docker compose version
+    Docker Compose version v2.x.x
+
+✅ 3. Crear los directorios persistentes necesarios
+
+    Antes de levantar, crea las carpetas que el compose espera:
+        mkdir -p postgres/data
+        mkdir -p asterisk/config asterisk/sounds asterisk/logs
+
+✅ 4. Verificar que existen las imágenes GPU
+
+Tu compose usa estas imágenes:
+	•	dgx-whisper-large
+	•	dgx-oss-20b
+	•	dgx-chatterbox-tts
+
+
+✅ 5. Levantar servicios básicos primero (Postgres)
+
+    docker compose up -d postgres
+
+    Verifica:
+
+        docker ps
+
+    Ver logs:
+        docker logs -f pg_core
+
+
+    ✅ 6. Levantar Asterisk
+
+
+✅ 7. Levantar TODO (cuando ya existan imágenes)
+Cuando ya tengas los builds hechos:
+
+docker compose up -d
+
+Esto levanta:
+	•	postgres
+	•	asterisk
+	•	whisper
+	•	llm
+	•	tts

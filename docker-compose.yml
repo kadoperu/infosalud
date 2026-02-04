@@ -33,6 +33,7 @@ services:
   # --------------------------------------------------
   # Asterisk (SIP + AudioSocket)
   # --------------------------------------------------
+  # NOTE: /etc/asterisk is exposed via bind mount ./asterisk/config:/etc/asterisk
   asterisk:
     build: ./asterisk
     container_name: asterisk
@@ -49,6 +50,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      whisper:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
     networks:
       - voice_net
 
@@ -60,13 +67,8 @@ services:
     image: dgx-whisper-large
     container_name: whisper_stt
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    gpus: all
+    shm_size: "4gb"
     environment:
       WHISPER_MODEL: large-v3
       WHISPER_DEVICE: cuda
@@ -74,6 +76,11 @@ services:
       - "8001:8000"        # WS / HTTP STT
     networks:
       - voice_net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect((\"127.0.0.1\", 8000)); s.close()' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 
   # --------------------------------------------------
@@ -83,13 +90,12 @@ services:
     image: dgx-oss-20b
     container_name: llm_oss_20b
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    gpus: all
+    ipc: host
+    shm_size: "16gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
     environment:
       MODEL_NAME: openoss-20b
       MAX_TOKENS: 512
@@ -97,6 +103,11 @@ services:
       - "8002:8000"        # API LLM
     networks:
       - voice_net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect((\"127.0.0.1\", 8000)); s.close()' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 
   # --------------------------------------------------
@@ -106,13 +117,8 @@ services:
     image: dgx-chatterbox-tts
     container_name: tts_chatterbox
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    gpus: all
+    shm_size: "4gb"
     environment:
       TTS_MODEL: chatterbox-turbo
       SAMPLE_RATE: 16000
@@ -120,3 +126,8 @@ services:
       - "8003:8000"        # API / WS TTS
     networks:
       - voice_net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect((\"127.0.0.1\", 8000)); s.close()' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
